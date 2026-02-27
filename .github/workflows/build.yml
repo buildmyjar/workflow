@@ -1,0 +1,108 @@
+name: Build Me That JAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'GitHub Release URL'
+        required: true
+        type: string
+      java_version:
+        description: 'Java Version'
+        required: true
+        type: string
+        default: '21'
+      build_system:
+        description: 'Build System'
+        required: true
+        type: choice
+        options:
+          - gradle
+          - maven
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse Metadata
+        id: parse
+        run: |
+          URL="${{ inputs.release_url }}"
+          CLEAN_URL=$(echo "$URL" | sed -e 's|https://github.com/||' -e 's|http://github.com/||')
+          OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
+          REPO=$(echo "$CLEAN_URL" | cut -d'/' -f2)
+          TAG=$(echo "$CLEAN_URL" | cut -d'/' -f5)
+          
+          echo "owner=$OWNER" >> $GITHUB_OUTPUT
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          
+          echo "target_full_name=$OWNER/$REPO" >> $GITHUB_ENV
+          echo "target_repo=$REPO" >> $GITHUB_ENV
+          echo "target_version=$TAG" >> $GITHUB_ENV
+
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.repo }}
+          ref: ${{ steps.parse.outputs.tag }}
+          path: plugin_source
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'temurin'
+          cache: ${{ inputs.build_system }}
+          cache-dependency-path: |
+            plugin_source/**/*.gradle*
+            plugin_source/**/pom.xml
+
+      - name: Build Maven
+        if: inputs.build_system == 'maven'
+        run: |
+          cd plugin_source
+          mvn clean package source:jar -DskipTests
+          mkdir ../artifacts
+          find target -maxdepth 2 -name "*.jar" ! -name "original-*.jar" -exec cp {} ../artifacts/ \;
+
+      - name: Build Gradle
+        if: inputs.build_system == 'gradle'
+        run: |
+          cd plugin_source
+          chmod +x ./gradlew
+          ./gradlew clean build sourcesJar -x test || ./gradlew clean build -x test
+          mkdir ../artifacts
+          find build/libs -maxdepth 2 -name "*.jar" -exec cp {} ../artifacts/ \;
+
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_VERSION="${{ env.target_repo }}-${{ env.target_version }}"
+          TAG_LATEST="${{ env.target_repo }}-latest"
+          RELEASE_TITLE="${{ env.target_full_name }}-${{ env.target_version }}"
+          
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          gh release delete "$TAG_VERSION" --cleanup-tag -y || true
+          gh release create "$TAG_VERSION" artifacts/*.jar \
+            --title "$RELEASE_TITLE" \
+            --notes "Automated build of ${{ env.target_full_name }} tag ${{ env.target_version }}"
+
+          git tag -f "$TAG_LATEST"
+          git push -f origin "$TAG_LATEST"
+          
+          gh release delete "$TAG_LATEST" --cleanup-tag -y || true
+          gh release create "$TAG_LATEST" artifacts/*.jar \
+            --title "${{ env.target_full_name }}-latest" \
+            --notes "Latest automated build of ${{ env.target_repo }}."
